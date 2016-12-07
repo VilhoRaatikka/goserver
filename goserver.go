@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -84,7 +85,8 @@ func runServer(laddr net.UnixAddr) {
 				continue
 			}
 		}
-		// Launch server routine
+		// Launch server routine for reading and processing data
+		// from the connection
 		go monRequestServe(conn, doneChan, &counter)
 	}
 }
@@ -176,29 +178,10 @@ func getAuditEvent(srcCStruct *C.voidStruct) interface{} {
 		UserName:  C.GoString((*C.auditEvent)(unsafe.Pointer(srcCStruct)).UserName)}
 }
 
-//export addMonStats
-func addMonStats(evType C.monEventType,
-	ev *C.voidStruct,
-	msg string,
-	reply *string,
-	errReply *string) {
-
-	log.Println("addMonStats")
-	var laddr net.UnixAddr
+func connectMonitorServer(laddr net.UnixAddr) (net.Conn, error) {
 	var conn net.Conn
 	var err error
 	tickChan := time.NewTicker(time.Millisecond * 100)
-	laddr.Net = "unix"
-	laddr.Name = "/tmp/monSocket"
-	var goEventIF interface{}
-
-	goEventIF = getGoEvent(evType, ev)
-
-	if goEventIF == nil {
-		*errReply = "Invalid event type structure"
-		return
-	}
-
 	// connect monitor server
 	conn, err = net.Dial(laddr.Net, laddr.Name)
 
@@ -218,32 +201,61 @@ func addMonStats(evType C.monEventType,
 					continue
 				}
 			} else {
-				break
+				return conn, err
 			}
 		}
 	}
+	return conn, err
+}
+
+//export addMonStats
+func addMonStats(evType C.monEventType,
+	ev *C.voidStruct,
+	msg string,
+	reply *string,
+	errReply *string) {
+
+	log.Println("addMonStats")
+	var laddr net.UnixAddr
+	var conn net.Conn
+	var err error
+	laddr.Net = "unix"
+	laddr.Name = "/tmp/monSocket"
+	var goEventIF interface{}
+
+	// Create go struct from c input struct
+	goEventIF = getGoEvent(evType, ev)
+
+	if goEventIF == nil {
+		*errReply = "Invalid event type structure"
+		return
+	}
+
+	// Connect monitor server
+	conn, err = connectMonitorServer(laddr)
+	if err != nil {
+		log.Fatalf("Failed to connect monitor server : %s", err)
+	}
+	// Generate JSON out of input struct
 	msgJSON, err := json.Marshal(goEventIF)
 
 	if err != nil {
-		log.Printf("Failed to create JSON : %s\n", err)
+		log.Fatalf("Failed to create JSON : %s\n", err)
+	}
+
+	// Send JSON to kafka
+	*errReply = produceSyncMessage(string(msgJSON),
+		getEventTypeString(evType))
+
+	// send to socket and read the reply
+	fmt.Fprintf(conn, string(msgJSON)+"\n")
+	srvReply, err := bufio.NewReader(conn).ReadString('\n')
+
+	if err != nil {
+		log.Printf("Client failed to read message : %s", err)
 	} else {
-		log.Printf("msg : %s\n", string(msgJSON))
-
-		// Send to kafka
-		*errReply = produceSyncMessage(string(msgJSON),
-			getEventTypeString(evType))
-
-		// send to socket and read the reply
-		fmt.Fprintf(conn, string(msgJSON)+"\n")
-		srvReply, err := bufio.NewReader(conn).ReadString('\n')
-
-		if err != nil {
-			log.Printf("Client failed to read message : %s", err)
-		} else {
-			fmt.Println("Server: " + srvReply)
-			*reply = srvReply
-		}
-
+		fmt.Println("Server: " + srvReply)
+		*reply = srvReply
 	}
 
 	defer func() {
@@ -290,7 +302,7 @@ func produceSyncMessage(msgstr string, topic string) string {
 
 func addEvent(conn net.Conn, msg string, counter *Counter) {
 	log.Println("addEvent")
-	*counter++
+	atomic.AddInt64((*int64)(counter), 1)
 	conn.Write([]byte(fmt.Sprintf("%d\n", *counter)))
 }
 
