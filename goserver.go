@@ -95,25 +95,30 @@ func monRequestServe(conn net.Conn,
 	doneChan chan<- bool,
 	counter *Counter) {
 
+	var messages []string
 	log.Println("monRequestServe")
 
 	for {
-		// Listen for messages ending in newline (\n)
-		message, err := bufio.NewReader(conn).ReadString('\n')
+		// Listen for msgJSONs ending in newline (\n)
+		msgJSON, err := bufio.NewReader(conn).ReadString('\n')
 
 		if err != nil {
 			log.Printf("Reading client message failed : %s", err)
 			break
 		} else {
-			log.Printf("Monitor server received from client : %s", message)
+			log.Printf("Monitor server received from client : %s", msgJSON)
+			messages = strings.SplitN(msgJSON, " ", 3)
 
-			if strings.TrimRight(message, "\n") == "add" {
-				addEvent(conn, message, counter)
-			} else if strings.Contains(message, "EventID") {
-				addEvent(conn, message, counter)
-			} else if strings.TrimRight(message, "\n") == "get" {
-				getStats(conn, message, counter)
-			} else if strings.TrimRight(message, "\n") == "quitmonitor" {
+			if strings.EqualFold(messages[0], "add") {
+				addEvent(conn, msgJSON, counter)
+				// Send JSON to kafka
+				err = produceSyncMessage(messages[1:])
+				if err != nil {
+					log.Printf("Producing sync message failed : %s", err)
+				}
+			} else if strings.EqualFold(messages[0], "get") {
+				getStats(conn, msgJSON, counter)
+			} else if strings.EqualFold(messages[0], "quitmonitor") {
 				sendExit(conn)
 				doneChan <- true
 				break
@@ -152,30 +157,6 @@ func getGoEvent(evType C.monEventType, srcCStruct *C.voidStruct) interface{} {
 			UserName:  C.GoString((*C.auditEvent)(unsafe.Pointer(srcCStruct)).UserName)}
 	}
 	return nil
-}
-
-func getFileWriteEvent(srcCStruct *C.voidStruct) interface{} {
-	return &struct {
-		Nbytes   int
-		FileName string
-		FuncName string
-	}{Nbytes: int((*C.fileWriteEvent)(unsafe.Pointer(srcCStruct)).Nbytes),
-		FileName: C.GoString((*C.fileWriteEvent)(unsafe.Pointer(srcCStruct)).FileName),
-		FuncName: C.GoString((*C.fileWriteEvent)(unsafe.Pointer(srcCStruct)).FuncName)}
-}
-
-func getAuditEvent(srcCStruct *C.voidStruct) interface{} {
-	return &struct {
-		EventID   int
-		ConnID    int
-		TimeStamp int
-		Name      string
-		UserName  string
-	}{EventID: int((*C.auditEvent)(unsafe.Pointer(srcCStruct)).EventID),
-		ConnID:    int((*C.auditEvent)(unsafe.Pointer(srcCStruct)).ConnID),
-		TimeStamp: int((*C.auditEvent)(unsafe.Pointer(srcCStruct)).TimeStamp),
-		Name:      C.GoString((*C.auditEvent)(unsafe.Pointer(srcCStruct)).Name),
-		UserName:  C.GoString((*C.auditEvent)(unsafe.Pointer(srcCStruct)).UserName)}
 }
 
 func connectMonitorServer(laddr net.UnixAddr) (net.Conn, error) {
@@ -242,13 +223,8 @@ func addMonStats(evType C.monEventType,
 	if err != nil {
 		log.Fatalf("Failed to create JSON : %s\n", err)
 	}
-
-	// Send JSON to kafka
-	*errReply = produceSyncMessage(string(msgJSON),
-		getEventTypeString(evType))
-
-	// send to socket and read the reply
-	fmt.Fprintf(conn, string(msgJSON)+"\n")
+	// Write event type and message as JSON to server
+	fmt.Fprintf(conn, "%s %s %s\n", msg, getEventTypeString(evType), string(msgJSON))
 	srvReply, err := bufio.NewReader(conn).ReadString('\n')
 
 	if err != nil {
@@ -264,12 +240,13 @@ func addMonStats(evType C.monEventType,
 }
 
 // Produce a messeage to kafka
-func produceSyncMessage(msgstr string, topic string) string {
+func produceSyncMessage(msgstr []string) error {
+	var errReply string
+
 	log.Println("produceSyncMessage")
 	config := sarama.NewConfig()
 	config.Producer.RequiredAcks = sarama.WaitForAll
 	config.Producer.Retry.Max = 5
-	var errReply string
 
 	brokers := []string{"kafkabroker1:9092", "kafkabroker2:9092", "kafkabroker3:9092"}
 	producer, err := sarama.NewSyncProducer(brokers, config)
@@ -277,7 +254,7 @@ func produceSyncMessage(msgstr string, topic string) string {
 	if err != nil {
 		errReply = fmt.Sprintf("FAILED to send message: %s\n", err)
 		log.Printf(errReply)
-		return errReply
+		return err
 	}
 
 	defer func() {
@@ -285,19 +262,21 @@ func produceSyncMessage(msgstr string, topic string) string {
 			log.Fatalln(err)
 		}
 	}()
+	// Create Kafka message consisting of topic and value, from string array
 	msg := &sarama.ProducerMessage{
-		Topic: topic,
-		Value: sarama.StringEncoder(msgstr)}
+		Topic: msgstr[0],
+		Value: sarama.StringEncoder(msgstr[1])}
 
 	partition, offset, err := producer.SendMessage(msg)
 
 	if err != nil {
 		errReply = fmt.Sprintf("FAILED to send message: %s\n", err)
 		log.Printf(errReply)
+		return err
 	} else {
 		log.Printf("> message sent to partition %d at offset %d\n", partition, offset)
 	}
-	return errReply
+	return nil
 }
 
 func addEvent(conn net.Conn, msg string, counter *Counter) {
@@ -333,7 +312,6 @@ func getEventTypeString(evType C.monEventType) string {
 		return "FileWriteEvent"
 	case C.AUDITEVENT:
 		return "AuditEvent"
-		break
 	}
 	return ""
 }
