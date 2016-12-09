@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <unistd.h>
-#include "goserver.h"
+#include "goclient.h"
 #include <string.h>
 #include <pthread.h>
 #include <sys/time.h>
