@@ -9,7 +9,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/VilhoRaatikka/monitor/goserver"
+	"github.com/VilhoRaatikka/goserver/goserver"
 )
 
 /*
@@ -149,7 +149,7 @@ func addMonStats(evType C.monEventType,
 	if err != nil {
 		log.Printf("Client failed to read message : %s", err)
 	} else {
-		fmt.Println("Server: " + srvReply)
+		fmt.Println("From server: " + srvReply)
 		*reply = srvReply
 	}
 
