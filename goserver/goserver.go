@@ -159,21 +159,30 @@ func addEvent(conn net.Conn, category string, evInfo *EventInfo) {
 	} else {
 		(*evInfo).evMap[category]++
 	}
-	log.Println((*evInfo).evMap)
+	s, err := json.Marshal((*evInfo).evMap)
 	// Unlock
 	(*evInfo).evMutex.Unlock()
-	s, _ := json.Marshal((*evInfo).evMap)
-	conn.Write([]byte(fmt.Sprintln(string(s))))
+
+	if err != nil {
+		conn.Write([]byte(fmt.Sprintf("Failed to create JSON: %s\n", err)))
+	} else {
+		conn.Write([]byte(fmt.Sprintln(string(s))))
+	}
 }
 
 func getStats(conn net.Conn, evInfo *EventInfo) {
 	log.Println("> getStats")
 	// Lock
 	(*evInfo).evMutex.Lock()
-	s, _ := json.Marshal((*evInfo).evMap)
+	s, err := json.Marshal((*evInfo).evMap)
 	// Unlock
 	(*evInfo).evMutex.Unlock()
-	conn.Write([]byte(fmt.Sprintln(string(s))))
+
+	if err != nil {
+		conn.Write([]byte(fmt.Sprintf("Failed to create JSON: %s\n", err)))
+	} else {
+		conn.Write([]byte(fmt.Sprintln(string(s))))
+	}
 }
 
 func sendUsage(conn net.Conn) {
