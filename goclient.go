@@ -93,7 +93,7 @@ func getGoEvent(evType C.monEventType, srcCStruct *C.voidStruct) (int, interface
 	return 0, nil
 }
 
-func connectMonitorServer(servedChan chan<- bool, laddr net.UnixAddr) (net.Conn, error) {
+func connectMonitorServer(laddr net.UnixAddr) (net.Conn, error) {
 	var conn net.Conn
 	var err error
 	tickChan := time.NewTicker(time.Millisecond * 100)
@@ -103,7 +103,7 @@ func connectMonitorServer(servedChan chan<- bool, laddr net.UnixAddr) (net.Conn,
 	if err != nil {
 		// Server isn't running, so start and keep it running
 		// until process termination or till exit msg is sent
-		go goserver.RunServer(servedChan, laddr)
+		go goserver.RunServer(laddr)
 
 		for {
 			// re-connect monitor server now when server is supposed to be started and running
@@ -147,7 +147,6 @@ func addMonStats(evType C.monEventType,
 	var err error
 	var goEventIF interface{}
 	var connID int
-	var servedChan chan bool
 	laddr.Net = "unix"
 	laddr.Name = "/tmp/monSocket"
 
@@ -158,9 +157,8 @@ func addMonStats(evType C.monEventType,
 		*errReply = "Invalid event type structure"
 		return
 	}
-	// Create notifier channel and connect the server routine
-	servedChan = make(chan bool, 1)
-	conn, err = connectMonitorServer(servedChan, laddr)
+	// Connect the server routine
+	conn, err = connectMonitorServer(laddr)
 
 	if err != nil {
 		log.Fatalf("Failed to connect monitor server : %s", err)
@@ -172,8 +170,7 @@ func addMonStats(evType C.monEventType,
 		log.Fatalf("Failed to create JSON : %s\n", err)
 	}
 	// Write event type and message as JSON to server
-	var n int
-	n, err = fmt.Fprintf(conn,
+	_, err = fmt.Fprintf(conn,
 		"%s %s %d %s\n",
 		msg, getEventTypeString(evType),
 		connID,
@@ -182,6 +179,7 @@ func addMonStats(evType C.monEventType,
 	if err != nil {
 		log.Printf("Writing to server failed : %s", err)
 	}
+	// Block until server has responded
 	srvReply, err := bufio.NewReader(conn).ReadString('\n')
 
 	if err != nil {
@@ -190,14 +188,6 @@ func addMonStats(evType C.monEventType,
 		// fmt.Println("From server: " + srvReply)
 		*reply = srvReply
 	}
-	// Wait until server has completed writing
-	log.Println("Entering select")
-	select {
-	case <-servedChan:
-		log.Printf("Wrote %d bytes to server\n", n)
-	}
-	log.Println("Exiting select")
-
 	defer func() {
 		conn.Close()
 	}()

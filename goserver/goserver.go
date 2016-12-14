@@ -13,6 +13,8 @@ import (
 
 	"encoding/json"
 
+	"io"
+
 	"github.com/Shopify/sarama"
 )
 
@@ -26,8 +28,8 @@ type EventInfo struct {
 
 //export goserver.RunServer
 // Server thread. Runs until process termination or until exit message
-func RunServer(servedChan chan<- bool, laddr net.UnixAddr) {
-	log.Println("> runServer")
+func RunServer(laddr net.UnixAddr) {
+	// log.Println("> runServer")
 	var conn net.Conn
 	var err error
 	var kafkaSyncProducer sarama.SyncProducer
@@ -43,12 +45,10 @@ func RunServer(servedChan chan<- bool, laddr net.UnixAddr) {
 	for {
 		select {
 		case <-doneChan:
-			log.Println("servedChan <- true")
-			servedChan <- true
 			return
 
 		default:
-			fmt.Println("Before Accept")
+			// fmt.Println("Before Accept")
 			// accept connection on port
 			ln.SetDeadline(time.Now().Add(1 * time.Second))
 			conn, err = ln.Accept()
@@ -60,8 +60,7 @@ func RunServer(servedChan chan<- bool, laddr net.UnixAddr) {
 		}
 		// Launch server routine for reading and processing data
 		// from the connection
-		go monRequestServe(servedChan,
-			conn,
+		go monRequestServe(conn,
 			kafkaSyncProducer,
 			kafkaBrokers,
 			doneChan,
@@ -83,29 +82,29 @@ func listenUnixSocket(laddr net.UnixAddr) *net.UnixListener {
 	return ln
 }
 
-func monRequestServe(servedChan chan<- bool,
-	conn net.Conn,
+func monRequestServe(conn net.Conn,
 	kafkaSyncProducer sarama.SyncProducer,
 	kafkaBrokers []string,
 	doneChan chan<- bool,
 	evInfo *EventInfo) {
 
 	var messages []string
-	log.Println("> monRequestServe")
+	// log.Println("> monRequestServe")
 
 	for {
 		// Listen for msgJSONs ending in newline (\n)
 		msgJSON, err := bufio.NewReader(conn).ReadString('\n')
 
 		if err != nil {
-			log.Printf("Reading client message failed : %s", err)
+			if err != io.EOF {
+				log.Printf("Reading client message failed : %s", err)
+			}
 			break
 		} else {
-			log.Printf("Received from client : %s\n", msgJSON)
+			// log.Printf("Received from client : %s\n", msgJSON)
 			messages = strings.SplitN(msgJSON, " ", 4)
 
 			if strings.EqualFold(messages[0], "add") {
-				addEvent(conn, messages[1], evInfo)
 				// Send all but 1st string to mesage service
 				kafkaSyncProducer, kafkaBrokers, err = produceSyncMessage(kafkaSyncProducer,
 					kafkaBrokers,
@@ -113,6 +112,8 @@ func monRequestServe(servedChan chan<- bool,
 				if err != nil {
 					log.Printf("Producing sync message failed : %s", err)
 				}
+				// Write back to client
+				addEvent(conn, messages[1], evInfo)
 			} else if strings.EqualFold(messages[0], "get") {
 				getStats(conn, evInfo)
 			} else if strings.EqualFold(messages[0], "quitmonitor") {
@@ -123,8 +124,6 @@ func monRequestServe(servedChan chan<- bool,
 				sendUsage(conn)
 			}
 		}
-		log.Println("servedChan <- true")
-		servedChan <- true
 	}
 }
 
@@ -136,7 +135,7 @@ func produceSyncMessage(kafkaSyncProducer sarama.SyncProducer,
 	var errReply string
 	var err error
 
-	log.Println("> produceSyncMessage")
+	// log.Println("> produceSyncMessage")
 	config := sarama.NewConfig()
 	config.Producer.RequiredAcks = sarama.WaitForAll
 	config.Producer.Retry.Max = 5

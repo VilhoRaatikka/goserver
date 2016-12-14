@@ -65,6 +65,5 @@ int main()
 		}
 	}
 	printf("After %dth getMonStats, counter : %s\n", i, reply_msg.p);
-	sleep(20);
 	return 1;
 }
