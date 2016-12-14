@@ -19,56 +19,81 @@ typedef void voidStruct;
 
 typedef enum {
 	FILEWRITEEVENT=0,
-	AUDITEVENT
+	AUDITEVENT,
+	DBWRITEEVENT
 } monEventType;
 
 typedef struct {
-    int   EventID;
     long  ConnID;
+    int   EventID;
 	long long  TimeStamp;
 	char*  Name;
 	char* UserName;
 } auditEvent;
 
 typedef struct {
+	long ConnID;
 	long Nbytes;
 	char* FileName;
 	char* FuncName;
 } fileWriteEvent;
+
+typedef struct {
+	long ConnID;
+	long long TimeStamp;
+	char* DBName;
+	char* TableName;
+	char* UserName;
+} dbWriteEvent;
 */
 import "C"
 
 /**
  * Find out the type of input C struct, and copy it to corresponding go struct. This is necessary because json.Marshal-function only can convert go types to json.
  */
-func getGoEvent(evType C.monEventType, srcCStruct *C.voidStruct) interface{} {
+func getGoEvent(evType C.monEventType, srcCStruct *C.voidStruct) (int, interface{}) {
 	switch evType {
 	case C.FILEWRITEEVENT:
-		return &struct {
+		return int((*C.fileWriteEvent)(unsafe.Pointer(srcCStruct)).ConnID), &struct {
+			ConnID   int
 			Nbytes   int
 			FileName string
 			FuncName string
-		}{Nbytes: int((*C.fileWriteEvent)(unsafe.Pointer(srcCStruct)).Nbytes),
+		}{ConnID: int((*C.fileWriteEvent)(unsafe.Pointer(srcCStruct)).ConnID),
+			Nbytes:   int((*C.fileWriteEvent)(unsafe.Pointer(srcCStruct)).Nbytes),
 			FileName: C.GoString((*C.fileWriteEvent)(unsafe.Pointer(srcCStruct)).FileName),
 			FuncName: C.GoString((*C.fileWriteEvent)(unsafe.Pointer(srcCStruct)).FuncName)}
 
 	case C.AUDITEVENT:
-		return &struct {
-			EventID   int
+		return int((*C.auditEvent)(unsafe.Pointer(srcCStruct)).ConnID), &struct {
 			ConnID    int
+			EventID   int
 			TimeStamp int
 			Name      string
 			UserName  string
-		}{EventID: int((*C.auditEvent)(unsafe.Pointer(srcCStruct)).EventID),
-			ConnID:    int((*C.auditEvent)(unsafe.Pointer(srcCStruct)).ConnID),
+		}{ConnID: int((*C.auditEvent)(unsafe.Pointer(srcCStruct)).ConnID),
+			EventID:   int((*C.auditEvent)(unsafe.Pointer(srcCStruct)).EventID),
 			TimeStamp: int((*C.auditEvent)(unsafe.Pointer(srcCStruct)).TimeStamp),
 			Name:      C.GoString((*C.auditEvent)(unsafe.Pointer(srcCStruct)).Name),
 			UserName:  C.GoString((*C.auditEvent)(unsafe.Pointer(srcCStruct)).UserName)}
+
+	case C.DBWRITEEVENT:
+		return int((*C.dbWriteEvent)(unsafe.Pointer(srcCStruct)).ConnID), &struct {
+			ConnID    int
+			TimeStamp int
+			DBName    string
+			TableName string
+			UserName  string
+		}{ConnID: int((*C.dbWriteEvent)(unsafe.Pointer(srcCStruct)).ConnID),
+			TimeStamp: int((*C.dbWriteEvent)(unsafe.Pointer(srcCStruct)).TimeStamp),
+			DBName:    C.GoString((*C.dbWriteEvent)(unsafe.Pointer(srcCStruct)).DBName),
+			TableName: C.GoString((*C.dbWriteEvent)(unsafe.Pointer(srcCStruct)).TableName),
+			UserName:  C.GoString((*C.dbWriteEvent)(unsafe.Pointer(srcCStruct)).UserName)}
 	}
-	return nil
+	return 0, nil
 }
 
-func connectMonitorServer(laddr net.UnixAddr) (net.Conn, error) {
+func connectMonitorServer(servedChan chan<- bool, laddr net.UnixAddr) (net.Conn, error) {
 	var conn net.Conn
 	var err error
 	tickChan := time.NewTicker(time.Millisecond * 100)
@@ -76,10 +101,9 @@ func connectMonitorServer(laddr net.UnixAddr) (net.Conn, error) {
 	conn, err = net.Dial(laddr.Net, laddr.Name)
 
 	if err != nil {
-		// Failing Dial indicates that server isn't running
-		// Monitor server routine is started and it remains active
+		// Server isn't running, so start and keep it running
 		// until process termination or till exit msg is sent
-		go goserver.RunServer(laddr)
+		go goserver.RunServer(servedChan, laddr)
 
 		for {
 			// re-connect monitor server now when server is supposed to be started and running
@@ -104,6 +128,8 @@ func getEventTypeString(evType C.monEventType) string {
 		return "FileWriteEvent"
 	case C.AUDITEVENT:
 		return "AuditEvent"
+	case C.DBWRITEEVENT:
+		return "DBWriteEvent"
 	}
 	return ""
 }
@@ -115,24 +141,27 @@ func addMonStats(evType C.monEventType,
 	reply *string,
 	errReply *string) {
 
-	log.Println("addMonStats")
+	// log.Println("addMonStats")
 	var laddr net.UnixAddr
 	var conn net.Conn
 	var err error
+	var goEventIF interface{}
+	var connID int
+	var servedChan chan bool
 	laddr.Net = "unix"
 	laddr.Name = "/tmp/monSocket"
-	var goEventIF interface{}
 
 	// Create go struct from c input struct
-	goEventIF = getGoEvent(evType, ev)
+	connID, goEventIF = getGoEvent(evType, ev)
 
 	if goEventIF == nil {
 		*errReply = "Invalid event type structure"
 		return
 	}
+	// Create notifier channel and connect the server routine
+	servedChan = make(chan bool, 1)
+	conn, err = connectMonitorServer(servedChan, laddr)
 
-	// Connect monitor server
-	conn, err = connectMonitorServer(laddr)
 	if err != nil {
 		log.Fatalf("Failed to connect monitor server : %s", err)
 	}
@@ -143,15 +172,31 @@ func addMonStats(evType C.monEventType,
 		log.Fatalf("Failed to create JSON : %s\n", err)
 	}
 	// Write event type and message as JSON to server
-	fmt.Fprintf(conn, "%s %s %s\n", msg, getEventTypeString(evType), string(msgJSON))
+	var n int
+	n, err = fmt.Fprintf(conn,
+		"%s %s %d %s\n",
+		msg, getEventTypeString(evType),
+		connID,
+		string(msgJSON))
+
+	if err != nil {
+		log.Printf("Writing to server failed : %s", err)
+	}
 	srvReply, err := bufio.NewReader(conn).ReadString('\n')
 
 	if err != nil {
 		log.Printf("Client failed to read message : %s", err)
 	} else {
-		fmt.Println("From server: " + srvReply)
+		// fmt.Println("From server: " + srvReply)
 		*reply = srvReply
 	}
+	// Wait until server has completed writing
+	log.Println("Entering select")
+	select {
+	case <-servedChan:
+		log.Printf("Wrote %d bytes to server\n", n)
+	}
+	log.Println("Exiting select")
 
 	defer func() {
 		conn.Close()

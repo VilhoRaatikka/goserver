@@ -24,25 +24,31 @@ type EventInfo struct {
 	evMutex *sync.Mutex
 }
 
-//export goserver.runServer
-func RunServer(laddr net.UnixAddr) {
+//export goserver.RunServer
+// Server thread. Runs until process termination or until exit message
+func RunServer(servedChan chan<- bool, laddr net.UnixAddr) {
 	log.Println("> runServer")
 	var conn net.Conn
 	var err error
+	var kafkaSyncProducer sarama.SyncProducer
+	var kafkaBrokers []string
 	eventInfo := EventInfo{evMap: map[string]Counter{}, evMutex: &sync.Mutex{}}
 	doneChan := make(chan bool)
 
 	ln := listenUnixSocket(laddr)
 
 	defer ln.Close()
-
+	// Loop every second and accept connections until message appears on
+	// doneChan
 	for {
 		select {
 		case <-doneChan:
+			log.Println("servedChan <- true")
+			servedChan <- true
 			return
 
 		default:
-			fmt.Println("Accept")
+			fmt.Println("Before Accept")
 			// accept connection on port
 			ln.SetDeadline(time.Now().Add(1 * time.Second))
 			conn, err = ln.Accept()
@@ -54,25 +60,33 @@ func RunServer(laddr net.UnixAddr) {
 		}
 		// Launch server routine for reading and processing data
 		// from the connection
-		go monRequestServe(conn, doneChan, &eventInfo)
+		go monRequestServe(servedChan,
+			conn,
+			kafkaSyncProducer,
+			kafkaBrokers,
+			doneChan,
+			&eventInfo)
 	}
 }
 
 func listenUnixSocket(laddr net.UnixAddr) *net.UnixListener {
-	log.Println("> listenUnixSocket")
+	// log.Println("> listenUnixSocket")
 	var ln *net.UnixListener
 	// listen client connections on socket
 	ln, err := net.ListenUnix(laddr.Net, &laddr)
 
 	for err != nil {
-		log.Printf("Listen failed : %s\n", err)
+		// log.Printf("Listen failed : %s\n", err)
 		os.Remove(laddr.Name)
 		ln, err = net.ListenUnix(laddr.Net, &laddr)
 	}
 	return ln
 }
 
-func monRequestServe(conn net.Conn,
+func monRequestServe(servedChan chan<- bool,
+	conn net.Conn,
+	kafkaSyncProducer sarama.SyncProducer,
+	kafkaBrokers []string,
 	doneChan chan<- bool,
 	evInfo *EventInfo) {
 
@@ -87,13 +101,15 @@ func monRequestServe(conn net.Conn,
 			log.Printf("Reading client message failed : %s", err)
 			break
 		} else {
-			log.Printf("Monitor server received from client : %s\n", msgJSON)
-			messages = strings.SplitN(msgJSON, " ", 3)
+			log.Printf("Received from client : %s\n", msgJSON)
+			messages = strings.SplitN(msgJSON, " ", 4)
 
 			if strings.EqualFold(messages[0], "add") {
 				addEvent(conn, messages[1], evInfo)
-				// Send JSON to kafka
-				err = produceSyncMessage(messages[1:])
+				// Send all but 1st string to mesage service
+				kafkaSyncProducer, kafkaBrokers, err = produceSyncMessage(kafkaSyncProducer,
+					kafkaBrokers,
+					messages[1:])
 				if err != nil {
 					log.Printf("Producing sync message failed : %s", err)
 				}
@@ -107,50 +123,59 @@ func monRequestServe(conn net.Conn,
 				sendUsage(conn)
 			}
 		}
+		log.Println("servedChan <- true")
+		servedChan <- true
 	}
 }
 
-// Produce a messeage to kafka
-func produceSyncMessage(msgstr []string) error {
+// Produce a messeage to messaging server
+func produceSyncMessage(kafkaSyncProducer sarama.SyncProducer,
+	kafkaBrokers []string,
+	msgstr []string) (sarama.SyncProducer, []string, error) {
+
 	var errReply string
+	var err error
 
 	log.Println("> produceSyncMessage")
 	config := sarama.NewConfig()
 	config.Producer.RequiredAcks = sarama.WaitForAll
 	config.Producer.Retry.Max = 5
 
-	brokers := []string{"kafkabroker1:9092", "kafkabroker2:9092", "kafkabroker3:9092"}
-	producer, err := sarama.NewSyncProducer(brokers, config)
+	// Create producer if not creted yet
+	if kafkaSyncProducer == nil {
+		kafkaBrokers = []string{"kafkabroker1:9092", "kafkabroker2:9092", "kafkabroker3:9092"}
+		kafkaSyncProducer, err = sarama.NewSyncProducer(kafkaBrokers, config)
 
-	if err != nil {
-		errReply = fmt.Sprintf("FAILED to send message: %s\n", err)
-		log.Printf(errReply)
-		return err
-	}
-
-	defer func() {
-		if err := producer.Close(); err != nil {
-			log.Fatalln(err)
+		if err != nil {
+			errReply = fmt.Sprintf("Failed to create producer: %s\n", err)
+			log.Printf(errReply)
+			return nil, kafkaBrokers, err
 		}
-	}()
+	}
 	// Create Kafka message consisting of topic and value, from string array
 	msg := &sarama.ProducerMessage{
 		Topic: msgstr[0],
-		Value: sarama.StringEncoder(strings.TrimSuffix(msgstr[1], "\n"))}
+		Key:   sarama.StringEncoder(strings.TrimSuffix(msgstr[1], "\n")),
+		Value: sarama.StringEncoder(strings.TrimSuffix(msgstr[2], "\n"))}
 
-	partition, offset, err := producer.SendMessage(msg)
+	partition, offset, err := kafkaSyncProducer.SendMessage(msg)
 
 	if err != nil {
-		errReply = fmt.Sprintf("FAILED to send message: %s\n", err)
+		errReply = fmt.Sprintf("Failed to send message: %s\n", err)
 		log.Printf(errReply)
 	} else {
-		log.Printf("sent %s:%s to partition %d at offset %d\n", msgstr[0], sarama.StringEncoder(strings.TrimSuffix(msgstr[1], "\n")), partition, offset)
+		log.Printf("sent %s %s %s to partition %d at offset %d\n",
+			msgstr[0],
+			sarama.StringEncoder(strings.TrimSuffix(msgstr[1], "\n")),
+			sarama.StringEncoder(strings.TrimSuffix(msgstr[2], "\n")),
+			partition,
+			offset)
 	}
-	return err
+	return kafkaSyncProducer, kafkaBrokers, err
 }
 
 func addEvent(conn net.Conn, category string, evInfo *EventInfo) {
-	log.Println("> addEvent")
+	// log.Println("> addEvent")
 	// Lock
 	(*evInfo).evMutex.Lock()
 	_, ok := (*evInfo).evMap[category]
@@ -171,7 +196,7 @@ func addEvent(conn net.Conn, category string, evInfo *EventInfo) {
 }
 
 func getStats(conn net.Conn, evInfo *EventInfo) {
-	log.Println("> getStats")
+	// log.Println("> getStats")
 	// Lock
 	(*evInfo).evMutex.Lock()
 	s, err := json.Marshal((*evInfo).evMap)
@@ -186,12 +211,12 @@ func getStats(conn net.Conn, evInfo *EventInfo) {
 }
 
 func sendUsage(conn net.Conn) {
-	log.Println("> sendUsage")
+	// log.Println("> sendUsage")
 	conn.Write([]byte("Invalid input. Accepted inputs are : " +
 		"\"add\", \"get\", or \"quitmonitor\".\n"))
 }
 
 func sendExit(conn net.Conn) {
-	log.Println("> sendExit")
+	// log.Println("> sendExit")
 	conn.Write([]byte("quit\n"))
 }
