@@ -138,7 +138,16 @@ func produceSyncMessage(kafkaSyncProducer sarama.SyncProducer,
 	// log.Println("> produceSyncMessage")
 	config := sarama.NewConfig()
 	config.Producer.RequiredAcks = sarama.WaitForAll
+	config.Producer.Return.Errors = true
+	config.Producer.Return.Successes = true
 	config.Producer.Retry.Max = 5
+	err = config.Validate()
+
+	if err != nil {
+		errReply = fmt.Sprintf("Configuration is not valid: %s\n", err)
+		log.Printf(errReply)
+		return nil, kafkaBrokers, err
+	}
 
 	// Create producer if not creted yet
 	if kafkaSyncProducer == nil {
